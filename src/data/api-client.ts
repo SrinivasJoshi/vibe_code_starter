@@ -1,21 +1,11 @@
-/**
- * API Client Configuration
- * 
- * This file sets up the base API client for making HTTP requests.
- * The proxy in vite.config.ts forwards requests from /app-name-s to your backend at localhost:8080
- */
+const API_BASE_URL = '/api'
 
-const API_BASE_URL = '/app-name-s'
-
-/**
- * Base fetch function with error handling
- */
 async function apiRequest<T>(
   endpoint: string,
   options?: RequestInit
 ): Promise<T> {
   const url = `${API_BASE_URL}${endpoint}`
-  
+
   const response = await fetch(url, {
     ...options,
     headers: {
@@ -31,16 +21,10 @@ async function apiRequest<T>(
   return response.json()
 }
 
-/**
- * GET request helper
- */
 export async function get<T>(endpoint: string): Promise<T> {
   return apiRequest<T>(endpoint, { method: 'GET' })
 }
 
-/**
- * POST request helper
- */
 export async function post<T>(endpoint: string, data?: unknown): Promise<T> {
   return apiRequest<T>(endpoint, {
     method: 'POST',
@@ -48,9 +32,6 @@ export async function post<T>(endpoint: string, data?: unknown): Promise<T> {
   })
 }
 
-/**
- * PUT request helper
- */
 export async function put<T>(endpoint: string, data?: unknown): Promise<T> {
   return apiRequest<T>(endpoint, {
     method: 'PUT',
@@ -58,9 +39,6 @@ export async function put<T>(endpoint: string, data?: unknown): Promise<T> {
   })
 }
 
-/**
- * DELETE request helper
- */
 export async function del<T>(endpoint: string): Promise<T> {
   return apiRequest<T>(endpoint, { method: 'DELETE' })
 }
