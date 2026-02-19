@@ -1,4 +1,5 @@
-const API_BASE_URL = '/api'
+declare const __BACKEND_BASE_PATH__: string
+const API_BASE_URL = __BACKEND_BASE_PATH__
 
 async function apiRequest<T>(
   endpoint: string,

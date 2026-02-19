@@ -16,7 +16,7 @@ const queryClient = new QueryClient({
 
 createRoot(document.getElementById('root')!).render(
   <QueryClientProvider client={queryClient}>
-    <BrowserRouter basename="/app-name"> {/* TODO: Change 'app-name' to your actual repo/project name */}
+    <BrowserRouter basename={import.meta.env.BASE_URL.replace(/\/$/, '')}>
       <App />
     </BrowserRouter>
   </QueryClientProvider>

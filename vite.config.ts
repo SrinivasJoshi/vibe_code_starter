@@ -1,21 +1,27 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
-import path from "path"
-import tailwindcss from "@tailwindcss/vite"
+import path from 'path'
+import tailwindcss from '@tailwindcss/vite'
+import { readFileSync } from 'fs'
 
-// https://vite.dev/config/
+const appConfig = JSON.parse(readFileSync('./app.config.json', 'utf-8'))
+const appName: string = appConfig.appName
+
 export default defineConfig({
-  base: '/app-name/', // TODO: Change 'app-name' to your actual repo/project name
+  base: `/${appName}/`,
   plugins: [react(), tailwindcss()],
   resolve: {
     alias: {
-      "@": path.resolve(__dirname, "./src"),
+      '@': path.resolve(__dirname, './src'),
     },
+  },
+  define: {
+    __BACKEND_BASE_PATH__: JSON.stringify(`/${appName}-s`),
   },
   server: {
     proxy: {
-      '/api': {
-        target: 'http://localhost:8080',
+      [`/${appName}-s`]: {
+        target: 'http://localhost:8000',
         changeOrigin: true,
         secure: false,
       },
