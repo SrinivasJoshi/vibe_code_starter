@@ -1,9 +1,14 @@
+import axios, { type AxiosRequestConfig } from 'axios'
+import { HttpsProxyAgent } from 'https-proxy-agent'
+import type { Agent } from 'https'
+
 export interface DatabricksConfig {
   host: string
   warehouseId: string
   clientId?: string
   clientSecret?: string
   pat?: string
+  proxyUrl?: string
   enableOBO?: boolean
   enableLogging?: boolean
   queryTimeoutSeconds?: number
@@ -29,6 +34,8 @@ export interface DatabricksUser {
 interface TokenResponse {
   access_token: string
   expires_in?: number
+  error_description?: string
+  error?: string
 }
 
 interface StatementResult {
@@ -52,6 +59,19 @@ interface ScimUserResponse {
   displayName?: string
   emails?: Array<{ value: string }>
   name?: { givenName?: string; familyName?: string }
+  detail?: string
+}
+
+interface AxiosErrorLike {
+  response?: {
+    status?: number
+    data?: Record<string, unknown>
+  }
+  message: string
+}
+
+function isAxiosError(error: unknown): error is AxiosErrorLike {
+  return typeof error === 'object' && error !== null && 'message' in error
 }
 
 export class DatabricksDB {
@@ -67,6 +87,7 @@ export class DatabricksDB {
   private readonly baseUrl: string
   private readonly isOAuth: boolean
   private readonly isPAT: boolean
+  private readonly httpsAgent: Agent | null
 
   private accessToken: string | null = null
   private tokenExpiresAt: number | null = null
@@ -86,9 +107,11 @@ export class DatabricksDB {
       throw new Error('DATABRICKS_HOST (config.host) is required')
     }
 
-    this.baseUrl = this.host.startsWith('http://') || this.host.startsWith('https://')
-      ? this.host
-      : `https://${this.host}`
+    let raw = this.host
+    if (!raw.startsWith('http://') && !raw.startsWith('https://')) {
+      raw = `https://${raw}`
+    }
+    this.baseUrl = raw.replace(/\/+$/, '')
 
     this.isOAuth = !!(this.clientId && this.clientSecret)
     this.isPAT = !!this.patToken
@@ -100,41 +123,61 @@ export class DatabricksDB {
       throw new Error('DATABRICKS_WAREHOUSE_ID (config.warehouseId) is required')
     }
 
+    const proxyUrl = config.proxyUrl ?? null
+    this.httpsAgent = proxyUrl ? new HttpsProxyAgent(proxyUrl) : null
+
     if (this.enableLogging) {
-      console.log(
-        `Databricks client: ${this.isOAuth ? 'OAuth' : 'PAT'}, warehouse: ${this.warehouseId}, OBO: ${this.enableOBO}`
-      )
+      console.log('')
+      console.log('========== DATABRICKS CONFIG ==========')
+      console.log(`  Auth    : ${this.isOAuth ? 'OAuth (service principal)' : 'PAT'}`)
+      console.log(`  Host    : ${this.baseUrl}`)
+      console.log(`  WH ID   : ${this.warehouseId}`)
+      console.log(`  OBO     : ${this.enableOBO}`)
+      console.log(`  Proxy   : ${proxyUrl ? proxyUrl.replace(/:[^:@]+@/, ':****@') : 'none'}`)
+      console.log('=======================================')
+      console.log('')
     }
+  }
+
+  private _axiosConfig(extra: AxiosRequestConfig = {}): AxiosRequestConfig {
+    const cfg: AxiosRequestConfig = { ...extra }
+    if (this.httpsAgent) {
+      cfg.httpsAgent = this.httpsAgent
+      cfg.proxy = false
+    }
+    return cfg
   }
 
   private async _getServicePrincipalToken(): Promise<string> {
     const tokenEndpoint = `${this.baseUrl}/oidc/v1/token`
-    const credentials = Buffer.from(`${this.clientId}:${this.clientSecret}`).toString('base64')
 
-    const response = await fetch(tokenEndpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Authorization': `Basic ${credentials}`,
-      },
-      body: 'grant_type=client_credentials&scope=all-apis',
-    })
+    try {
+      const response = await axios.post<TokenResponse>(
+        tokenEndpoint,
+        'grant_type=client_credentials&scope=all-apis',
+        this._axiosConfig({
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          auth: { username: this.clientId!, password: this.clientSecret! },
+        })
+      )
 
-    if (!response.ok) {
-      const text = await response.text()
-      throw new Error(`Token fetch failed (${response.status}): ${text}`)
+      this.accessToken = response.data.access_token
+      const expiresIn = response.data.expires_in ?? 3600
+      this.tokenExpiresAt = Date.now() + (expiresIn - 60) * 1000
+
+      if (this.enableLogging) {
+        console.log('>> Token refreshed, expires in:', expiresIn, 's')
+      }
+
+      return this.accessToken
+    } catch (error) {
+      if (isAxiosError(error)) {
+        const data = error.response?.data as TokenResponse | undefined
+        const msg = data?.error_description ?? data?.error ?? error.message
+        throw new Error(`Token fetch failed (${error.response?.status ?? 'network'}): ${msg}`)
+      }
+      throw error
     }
-
-    const data = (await response.json()) as TokenResponse
-    this.accessToken = data.access_token
-    const expiresIn = data.expires_in ?? 3600
-    this.tokenExpiresAt = Date.now() + (expiresIn - 60) * 1000
-
-    if (this.enableLogging) {
-      console.log('Service principal token refreshed, expires in:', expiresIn, 's')
-    }
-
-    return this.accessToken
   }
 
   private _isTokenExpired(): boolean {
@@ -145,24 +188,15 @@ export class DatabricksDB {
   private async _ensureServicePrincipalToken(): Promise<void> {
     if (!this.isOAuth) return
     if (this._isTokenExpired()) {
-      if (this.enableLogging) console.log('Token expired or missing, refreshing...')
+      if (this.enableLogging) console.log('>> Token expired or missing, refreshing...')
       await this._getServicePrincipalToken()
     }
   }
 
-  /** Resolve bearer token: OBO user token > service principal > PAT. */
   private async _resolveToken(userToken?: string | null): Promise<string> {
-    if (userToken && this.enableOBO) {
-      return userToken
-    }
-
+    if (userToken && this.enableOBO) return userToken
     await this._ensureServicePrincipalToken()
-
-    if (this.isOAuth) {
-      return this.accessToken!
-    }
-
-    return this.patToken!
+    return this.isOAuth ? this.accessToken! : this.patToken!
   }
 
   /** Execute SQL via the Databricks SQL Statements API. */
@@ -172,47 +206,28 @@ export class DatabricksDB {
     try {
       const bearerToken = await this._resolveToken(userToken)
       const waitTimeout = `${Math.min(this.queryTimeoutSeconds, 50)}s`
-
-      const submitResponse = await fetch(`${this.baseUrl}/api/2.0/sql/statements`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${bearerToken}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          warehouse_id: this.warehouseId,
-          statement: sql,
-          wait_timeout: waitTimeout,
-        }),
-      })
-
-      if (!submitResponse.ok) {
-        const errorData = await submitResponse.text()
-        throw new Error(`Query submission failed (${submitResponse.status}): ${errorData}`)
+      const headers = {
+        'Authorization': `Bearer ${bearerToken}`,
+        'Content-Type': 'application/json',
       }
 
-      let result = (await submitResponse.json()) as StatementResult
+      const submitResponse = await axios.post<StatementResult>(
+        `${this.baseUrl}/api/2.0/sql/statements`,
+        { warehouse_id: this.warehouseId, statement: sql, wait_timeout: waitTimeout },
+        this._axiosConfig({ headers })
+      )
+
+      let result = submitResponse.data
       const statementId = result.statement_id
 
       while (result.status?.state === 'PENDING' || result.status?.state === 'RUNNING') {
         await new Promise((r) => setTimeout(r, this.pollIntervalMs))
 
-        const statusResponse = await fetch(
+        const statusResponse = await axios.get<StatementResult>(
           `${this.baseUrl}/api/2.0/sql/statements/${statementId}`,
-          {
-            headers: {
-              'Authorization': `Bearer ${bearerToken}`,
-              'Content-Type': 'application/json',
-            },
-          }
+          this._axiosConfig({ headers })
         )
-
-        if (!statusResponse.ok) {
-          const text = await statusResponse.text()
-          throw new Error(`Query status check failed (${statusResponse.status}): ${text}`)
-        }
-
-        result = (await statusResponse.json()) as StatementResult
+        result = statusResponse.data
       }
 
       if (result.status?.state === 'FAILED') {
@@ -223,9 +238,7 @@ export class DatabricksDB {
       }
 
       const rows = result?.result?.data_array ?? []
-      if (!Array.isArray(rows) || rows.length === 0) {
-        return []
-      }
+      if (!Array.isArray(rows) || rows.length === 0) return []
 
       const columns = (result.manifest?.schema?.columns ?? []).map((col) => col.name)
       return rows.map((row) => {
@@ -236,17 +249,19 @@ export class DatabricksDB {
         return obj
       })
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      const isAuthError = message.includes('401') || message.includes('403')
+      if (isAxiosError(error)) {
+        const status = error.response?.status
+        const isAuthError = status === 401 || status === 403
 
-      if (isAuthError && !userToken && retryCount < 1) {
-        if (this.enableLogging) console.log('Auth error, refreshing token and retrying...')
-        this.accessToken = null
-        this.tokenExpiresAt = null
-        return this.runQuery(sql, { userToken: null, retryCount: retryCount + 1 })
+        if (isAuthError && !userToken && retryCount < 1) {
+          if (this.enableLogging) console.log('>> Auth error, forcing token refresh and retrying...')
+          this.accessToken = null
+          this.tokenExpiresAt = null
+          return this.runQuery(sql, { userToken: null, retryCount: retryCount + 1 })
+        }
+
+        if (this.enableLogging) console.error('>> Query failed:', error.response?.data ?? error.message)
       }
-
-      if (this.enableLogging) console.error('Query failed:', message)
       throw error
     }
   }
@@ -257,30 +272,37 @@ export class DatabricksDB {
       throw new Error('No user access token provided')
     }
 
-    const response = await fetch(`${this.baseUrl}/api/2.0/preview/scim/v2/Me`, {
-      headers: {
-        'Authorization': `Bearer ${userAccessToken}`,
-        'Content-Type': 'application/json',
-      },
-    })
+    try {
+      const response = await axios.get<ScimUserResponse>(
+        `${this.baseUrl}/api/2.0/preview/scim/v2/Me`,
+        this._axiosConfig({
+          headers: {
+            'Authorization': `Bearer ${userAccessToken}`,
+            'Content-Type': 'application/json',
+          },
+        })
+      )
 
-    if (!response.ok) {
-      const text = await response.text()
-      throw new Error(`SCIM /Me failed (${response.status}): ${text}`)
-    }
+      const userData = response.data
+      if (this.enableLogging) console.log('>> Current user retrieved from Databricks SCIM')
 
-    const userData = (await response.json()) as ScimUserResponse
-    if (this.enableLogging) console.log('Current user retrieved from Databricks SCIM')
-
-    return {
-      username: userData.userName ?? userData.displayName ?? '',
-      email: userData.emails?.[0]?.value ?? userData.userName ?? '',
-      displayName: userData.displayName ?? userData.userName ?? '',
-      firstName: userData.name?.givenName ?? '',
-      lastName: userData.name?.familyName ?? '',
-      isAuthenticated: true,
-      source: 'databricks_scim',
-      employeeID: userData.emails?.[0]?.value ?? userData.userName ?? '',
+      return {
+        username: userData.userName ?? userData.displayName ?? '',
+        email: userData.emails?.[0]?.value ?? userData.userName ?? '',
+        displayName: userData.displayName ?? userData.userName ?? '',
+        firstName: userData.name?.givenName ?? '',
+        lastName: userData.name?.familyName ?? '',
+        isAuthenticated: true,
+        source: 'databricks_scim',
+        employeeID: userData.emails?.[0]?.value ?? userData.userName ?? '',
+      }
+    } catch (error) {
+      if (isAxiosError(error)) {
+        const data = error.response?.data as ScimUserResponse | undefined
+        const msg = data?.detail ?? error.response?.data ?? error.message
+        throw new Error(`SCIM /Me failed (${error.response?.status ?? 'network'}): ${msg}`)
+      }
+      throw error
     }
   }
 
